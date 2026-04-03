@@ -1,3 +1,17 @@
+# What's New in Version 10.0.1
+
+macOS 26.4 broke HookCase by making many internal changes. HookCase
+10.0.1 works around them. This resolves
+[Issue #53](https://github.com/steven-michaud/HookCase/issues/53).
+
+One of the workarounds allows processes to load unsigned hook
+libraries. Otherwise even codesigned hook libraries wouldn't have
+worked. Loading them would have triggered the same crashes as loading
+unsigned hook libraries: Code Signature Invalid page access faults.
+
+So, as of macOS 26.4, you no longer need to codesign your hook
+libraries.
+
 # What's New in Version 10.0.0
 
 HookCase 10.0 now supports macOS 26 (Tahoe).
@@ -243,14 +257,14 @@ information see
 
 This version of HookCase fixes a bug that caused intermittent
 instability, though not kernel panics. I fixed it by tweaking the
-[code at the heart of HookCase's watchpoint support](HookCase/HookCase/HookCase.cpp#L16343).
+[code at the heart of HookCase's watchpoint support](HookCase/HookCase/HookCase.cpp#L16851).
 See [Issue #26](https://github.com/steven-michaud/HookCase/issues/26)
 for more information.
 
 HookCase's watchpoint code is quite complex. So if you see any sort of
 instability short of kernel panics, especially if it resembles what's
 reported at Issue #26, you should try
-[disabling watchpoint support](HookCase/HookCase/HookCase.cpp#L17282).
+[disabling watchpoint support](HookCase/HookCase/HookCase.cpp#L17790).
 
 # What's New in Version 5.0.3
 
@@ -426,7 +440,7 @@ HookCase now supports macOS Mojave (10.14).
 
 But Mojave's Debug kernel is currently very flaky -- lots of panics,
 with and without HookCase.  So support for the Debug kernel
-[has been disabled](HookCase/HookCase/HookCase.cpp#L818), at least
+[has been disabled](HookCase/HookCase/HookCase.cpp#L851), at least
 temporarily.
 
 # What's New in Version 2.1
@@ -456,12 +470,12 @@ can now hook methods that aren't in their module's symbol table.  For
 more information see
 [Hooked_sub_123abc() in the hook library template](HookLibraryTemplate/hook.mm#L1302).
 
-* Version 2.0 [fixes a bug](HookCase/HookCase/HookCase.cpp#L13986) that
+* Version 2.0 [fixes a bug](HookCase/HookCase/HookCase.cpp#L14494) that
 prevented interpose hooks from working outside the shared cache of
 system modules.
 
 * Version 2.0
-[fixes a previously undiscovered edge case](HookCase/HookCase/HookCase.cpp#L15785)
+[fixes a previously undiscovered edge case](HookCase/HookCase/HookCase.cpp#L16293)
 of an Apple kernel panic bug that was partially fixed in version 1.
 
 * Version 2.0

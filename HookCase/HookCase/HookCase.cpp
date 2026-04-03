@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// Copyright (c) 2025 Steven Michaud
+// Copyright (c) 2026 Steven Michaud
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -124,6 +124,7 @@
 #include <sys/spawn.h>
 #include <sys/sysctl.h>
 #include <sys/vnode.h>
+#include <kern/cs_blobs.h>
 #include <kern/host.h>
 #include <mach-o/loader.h>
 // This definition is missing from loader.h on some macOS versions
@@ -732,6 +733,38 @@ bool macOS_Sequoia_6_or_greater()
 bool macOS_Tahoe()
 {
   return ((OSX_Version() & 0xFF00) == MAC_OS_X_VERSION_26_HEX);
+}
+
+bool macOS_Tahoe_less_than_2()
+{
+  if (!((OSX_Version() & 0xFF00) == MAC_OS_X_VERSION_26_HEX)) {
+    return false;
+  }
+  return ((OSX_Version() & 0xFF) < 0x20);
+}
+
+bool macOS_Tahoe_2_or_greater()
+{
+  if (!((OSX_Version() & 0xFF00) == MAC_OS_X_VERSION_26_HEX)) {
+    return false;
+  }
+  return ((OSX_Version() & 0xFF) >= 0x20);
+}
+
+bool macOS_Tahoe_less_than_4()
+{
+  if (!((OSX_Version() & 0xFF00) == MAC_OS_X_VERSION_26_HEX)) {
+    return false;
+  }
+  return ((OSX_Version() & 0xFF) < 0x40);
+}
+
+bool macOS_Tahoe_4_or_greater()
+{
+  if (!((OSX_Version() & 0xFF00) == MAC_OS_X_VERSION_26_HEX)) {
+    return false;
+  }
+  return ((OSX_Version() & 0xFF) >= 0x40);
 }
 
 bool OSX_Version_Unsupported()
@@ -1524,6 +1557,9 @@ vm_page_t *g_vm_page_array_ending_addr = NULL;
 
 // Kernel private globals (end)
 
+// From the xnu kernel's osfmk/kern/zalloc.h
+typedef uint16_t zone_id_t;
+
 // From the xnu kernel's osfmk/mach/vm_types.h
 typedef uint16_t vm_tag_t;
 
@@ -1601,17 +1637,8 @@ typedef int (*vm_map_page_size_t)(vm_map_t map);
 typedef boolean_t (*vm_map_lookup_entry_t)(vm_map_t map,
                                            vm_map_address_t address,
                                            vm_map_entry_t *entry);
-typedef kern_return_t (*vm_map_lookup_locked_t)(vm_map_t *var_map,
-                                                vm_map_offset_t vaddr,
-                                                vm_prot_t fault_type,
-                                                int object_lock_type,
-                                                vm_map_version_t *out_version,
-                                                vm_object_t *object,
-                                                vm_object_offset_t *offset,
-                                                vm_prot_t *out_prot,
-                                                boolean_t *wired,
-                                                vm_object_fault_info_t fault_info,
-                                                vm_map_t *real_map);
+typedef vm_map_entry_t (*vm_map_lookup_t)(vm_map_t map,
+                                          vm_map_address_t address);
 typedef kern_return_t (*vm_map_protect_t)(vm_map_t map,
                                           vm_map_offset_t start,
                                           vm_map_offset_t end,
@@ -1647,6 +1674,8 @@ typedef int (*coalition_get_pid_list_t)(coalition_t coal, uint32_t rolemask,
                                         int sort_order, int *pid_list, int list_sz);
 typedef void (*vm_object_unlock_t)(vm_object_t object);
 typedef uint64_t (*proc_uniqueid_t)(proc_t p);
+typedef void (*zalloc_ro_mut_t)(zone_id_t zone_id, void *elem, vm_offset_t offset,
+                                const void *new_data, vm_size_t new_data_size);
 
 static current_map_t current_map = NULL;
 static get_task_map_reference_t get_task_map_reference = NULL;
@@ -1675,7 +1704,8 @@ static cpuid_leaf7_features_t cpuid_leaf7_features_ptr = NULL;
 static vm_fault_t vm_fault = NULL;
 static vm_map_page_mask_t vm_map_page_mask = NULL;
 static vm_map_page_size_t vm_map_page_size = NULL;
-static vm_map_lookup_entry_t vm_map_lookup_entry = NULL;
+static vm_map_lookup_entry_t vm_map_lookup_entry_ptr = NULL;
+static vm_map_lookup_t vm_map_lookup_ptr = NULL;
 static vm_map_protect_t vm_map_protect_ptr = NULL;
 static pmap_protect_t pmap_protect = NULL;
 static pmap_enter_t pmap_enter = NULL;
@@ -1701,8 +1731,9 @@ static coalition_get_pid_list_t coalition_get_pid_list = NULL;
 static vm_object_unlock_t vm_object_unlock_ptr = NULL;
 // Only on Sierra and up (end)
 // Only on Monterey and up (begin)
-static proc_uniqueid_t proc_uniqueid_ptr;
+static proc_uniqueid_t proc_uniqueid_ptr = NULL;
 // Only on Monterey and up (end)
+static zalloc_ro_mut_t zalloc_ro_mut = NULL;
 
 bool s_kernel_private_functions_found = false;
 
@@ -1945,11 +1976,18 @@ bool find_kernel_private_functions()
       return false;
     }
   }
-  if (!vm_map_lookup_entry) {
-    vm_map_lookup_entry = (vm_map_lookup_entry_t)
+  if (!vm_map_lookup_entry_ptr) {
+    // As of macOS 26.4 Apple made purely cosmetic changes to
+    // vm_map_lookup_entry() -- they changed its name and definition. We deal
+    // with this here and below.
+    vm_map_lookup_entry_ptr = (vm_map_lookup_entry_t)
       kernel_dlsym("_vm_map_lookup_entry");
-    if (!vm_map_lookup_entry) {
-      return false;
+    if (!vm_map_lookup_entry_ptr) {
+      vm_map_lookup_ptr = (vm_map_lookup_t)
+        kernel_dlsym("_vm_map_lookup");
+      if (!vm_map_lookup_ptr) {
+        return false;
+      }
     }
   }
   if (!vm_map_protect_ptr) {
@@ -2120,6 +2158,15 @@ bool find_kernel_private_functions()
       }
     }
   }
+  if (macOS_Tahoe_4_or_greater()) {
+    if (!zalloc_ro_mut) {
+      zalloc_ro_mut = (zalloc_ro_mut_t)
+        kernel_dlsym("_zalloc_ro_mut");
+      if (!zalloc_ro_mut) {
+        return false;
+      }
+    }
+  }
   s_kernel_private_functions_found = true;
   return true;
 }
@@ -2140,6 +2187,28 @@ static kern_return_t vm_map_protect(vm_map_t map,
   }
 
   return vm_protect(map, start, end - start, set_max, new_prot);
+}
+
+// As of macOS 26.4 Apple made purely cosmetic changes to
+// vm_map_lookup_entry() -- they changed its name and its definition. We deal
+// with this here and above.
+static boolean_t vm_map_lookup_entry(vm_map_t map,
+                                     vm_map_address_t address,
+                                     vm_map_entry_t *entry)
+{
+  if (vm_map_lookup_entry_ptr) {
+    return vm_map_lookup_entry_ptr(map, address, entry);
+  } else if (vm_map_lookup_ptr) {
+    vm_map_entry_t entry_local = vm_map_lookup_ptr(map, address);
+    if (entry_local) {
+      *entry = entry_local;
+      return true;
+    } else {
+      return false;
+    }
+  } else {
+    return false;
+  }
 }
 
 // From the xnu kernel's osfmk/i386/mp.h
@@ -2411,20 +2480,126 @@ typedef struct _vm_map_fake_tahoe {
   /* boolean_t */ uses_user_ranges:1,       /* has the map been configured to use user VM ranges */
   /* boolean_t */ tpro_enforcement:1,       /* enforce TPRO propagation */
   /* boolean_t */ corpse_source:1,          /* map is being used to create a corpse for diagnostics.*/
+  /* boolean_t */ cs_platform_binary:1,     /* map belongs to a platform binary */
+#define VM_MAP_NOT_SEALED 0                 /* map is not sealed and may be freely modified. */
+#define VM_MAP_WILL_BE_SEALED 1             /* map will be sealed and is subject to limited modification. */
+#define VM_MAP_SEALED 2                     /* map is sealed and should not be modified. */
+  /* unsigned int */ vmmap_sealed:2,        /* sealed state of map, see definitions above. */
   /* reserved */ res0:1,
-  /* reserved */ res1:1,
-  /* reserved */ is_sealed:1,
-  /* reserved  */pad:7;
+  /* reserved  */pad:6;
+  // In macOS 26.2 'timestamp' became uint64_t at offset 0xa8, but
+  // disappeared in macOS 26.4.
   unsigned int timestamp; // Offset 0xa4
 } *vm_map_fake_tahoe_t;
+
+typedef struct _vm_map_fake_tahoe_2 {
+  lck_rw_t lock;
+  struct vm_map_links links; // Actually 1st member of "struct vm_map_header hdr"
+#define hdr links
+  uint64_t pad1[2];
+  pmap_t pmap;            // Offset 0x40
+  vm_map_size_t size;     // Offset 0x48
+  uint64_t pad2[2];
+  vm_map_size_t user_wire_limit; // Offset 0x60
+  vm_map_size_t user_wire_size;  // Offset 0x68
+  uint32_t pad3[12];
+  unsigned int                   // Offset 0xa0
+  /* boolean_t */ wait_for_space:1,         /* Should callers wait for space? */
+  /* boolean_t */ wiring_required:1,        /* All memory wired? */
+  /* boolean_t */ no_zero_fill:1,           /* No zero fill absent pages */
+  /* boolean_t */ mapped_in_other_pmaps:1,  /* has this submap been mapped in maps that use a different pmap */
+  /* boolean_t */ switch_protect:1,         /* Protect map from write faults while switched */
+  /* boolean_t */ disable_vmentry_reuse:1,  /* All vm entries should keep using newer and higher addresses in the map */
+  /* boolean_t */ map_disallow_data_exec:1, /* Disallow execution from data pages on exec-permissive architectures */
+  /* boolean_t */ holelistenabled:1,
+  /* boolean_t */ is_nested_map:1,
+  /* boolean_t */ map_disallow_new_exec:1,  /* Disallow new executable code */
+  /* boolean_t */ jit_entry_exists:1,
+  /* boolean_t */ has_corpse_footprint:1,
+  /* boolean_t */ terminated:1,
+  /* boolean_t */ is_alien:1,               /* for platform simulation, i.e. PLATFORM_IOS on OSX */
+  /* boolean_t */ cs_enforcement:1,         /* code-signing enforcement */
+  /* boolean_t */ cs_debugged:1,            /* code-signed but debugged */
+  /* boolean_t */ reserved_regions:1,       /* has reserved regions. The map size that userspace sees should ignore these. */
+  /* boolean_t */ single_jit:1,             /* only allow one JIT mapping */
+  /* boolean_t */ never_faults:1,           /* this map should never cause faults */
+  /* boolean_t */ uses_user_ranges:1,       /* has the map been configured to use user VM ranges */
+  /* boolean_t */ tpro_enforcement:1,       /* enforce TPRO propagation */
+  /* boolean_t */ corpse_source:1,          /* map is being used to create a corpse for diagnostics.*/
+  /* boolean_t */ cs_platform_binary:1,     /* map belongs to a platform binary */
+#define VM_MAP_NOT_SEALED 0                 /* map is not sealed and may be freely modified. */
+#define VM_MAP_WILL_BE_SEALED 1             /* map will be sealed and is subject to limited modification. */
+#define VM_MAP_SEALED 2                     /* map is sealed and should not be modified. */
+  /* unsigned int */ vmmap_sealed:2,        /* sealed state of map, see definitions above. */
+  /* reserved */ res0:1,
+  /* reserved  */pad:6;
+  uint64_t timestamp; // Offset 0xa8
+} *vm_map_fake_tahoe_2_t;
+
+typedef struct _vm_map_fake_tahoe_4 {
+  // This is a "new" lck_rw_t structure. "Old" methods don't work on it, but
+  // the "new" methods have their symbols stripped from the symbol table. So we
+  // can't manipulate "new" locks until we reverse-engineer the "new" methods.
+  lck_rw_t lock;
+  uint64_t pad1[1];
+  struct vm_map_links links; // Actually 1st member of "struct vm_map_header hdr"
+#define hdr links
+  uint64_t pad2[4];
+  pmap_t pmap;            // Offset 0x58
+  vm_map_size_t size;     // Offset 0x60
+  uint64_t pad3[2];
+  vm_map_size_t user_wire_limit; // Offset 0x78
+  vm_map_size_t user_wire_size;  // Offset 0x80
+  uint32_t pad4[12];
+  unsigned int                   // Offset 0xb8
+  /* boolean_t */ wait_for_space:1,         /* Should callers wait for space? */
+  /* boolean_t */ wiring_required:1,        /* All memory wired? */
+  /* boolean_t */ no_zero_fill:1,           /* No zero fill absent pages */
+  /* boolean_t */ mapped_in_other_pmaps:1,  /* has this submap been mapped in maps that use a different pmap */
+  /* boolean_t */ switch_protect:1,         /* Protect map from write faults while switched */
+  /* boolean_t */ disable_vmentry_reuse:1,  /* All vm entries should keep using newer and higher addresses in the map */
+  /* boolean_t */ map_disallow_data_exec:1, /* Disallow execution from data pages on exec-permissive architectures */
+  /* boolean_t */ holelistenabled:1,
+  /* boolean_t */ is_nested_map:1,
+  /* boolean_t */ map_disallow_new_exec:1,  /* Disallow new executable code */
+  /* boolean_t */ jit_entry_exists:1,
+  /* boolean_t */ has_corpse_footprint:1,
+  /* boolean_t */ terminated:1,
+  /* boolean_t */ is_alien:1,               /* for platform simulation, i.e. PLATFORM_IOS on OSX */
+  /* boolean_t */ cs_enforcement:1,         /* code-signing enforcement */
+  /* boolean_t */ cs_debugged:1,            /* code-signed but debugged */
+  /* boolean_t */ reserved_regions:1,       /* has reserved regions. The map size that userspace sees should ignore these. */
+  /* boolean_t */ single_jit:1,             /* only allow one JIT mapping */
+  /* boolean_t */ never_faults:1,           /* this map should never cause faults */
+  /* boolean_t */ uses_user_ranges:1,       /* has the map been configured to use user VM ranges */
+  /* boolean_t */ tpro_enforcement:1,       /* enforce TPRO propagation */
+  /* boolean_t */ corpse_source:1,          /* map is being used to create a corpse for diagnostics.*/
+  /* boolean_t */ cs_platform_binary:1,     /* map belongs to a platform binary */
+#define VM_MAP_NOT_SEALED 0                 /* map is not sealed and may be freely modified. */
+#define VM_MAP_WILL_BE_SEALED 1             /* map will be sealed and is subject to limited modification. */
+#define VM_MAP_SEALED 2                     /* map is sealed and should not be modified. */
+  /* unsigned int */ vmmap_sealed:2,        /* sealed state of map, see definitions above. */
+  /* reserved */ res0:1,
+  /* reserved  */pad:6;
+  /*
+   * Weak reference to the task that owns this map. This will be NULL if the
+   * map has terminated, so you must have a task reference to be able to safely
+   * access this. Under the map lock, you can safely acquire a task reference
+   * if owning_task is not NULL, since vm_map_terminate requires the map lock.
+   */
+  task_t owning_task; // Offset 0xc0
+} *vm_map_fake_tahoe_4_t;
 
 pmap_t vm_map_pmap(vm_map_t map)
 {
   if (!map) {
     return NULL;
   }
-  if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
-      macOS_Ventura() || macOS_Monterey_3_or_greater())
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_fake_tahoe_4_t m = (vm_map_fake_tahoe_4_t) map;
+    return m->pmap;
+  } else if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
+             macOS_Ventura() || macOS_Monterey_3_or_greater())
   {
     vm_map_fake_monterey_3_t m = (vm_map_fake_monterey_3_t) map;
     return m->pmap;
@@ -2439,13 +2614,20 @@ pmap_t vm_map_pmap(vm_map_t map)
   }
 }
 
-unsigned int vm_map_timestamp(vm_map_t map)
+uint64_t vm_map_timestamp(vm_map_t map)
 {
   if (!map) {
     return 0;
   }
-  unsigned int retval = 0;
-  if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma()) {
+  uint64_t retval = 0;
+  if (macOS_Tahoe_4_or_greater()) {
+    // timestamp seems to have disappeared as of macOS 26.4.
+    return 0;
+  } else if (macOS_Tahoe_2_or_greater()) {
+    // As of macOS 26.2 timestamp changed from unsigned int to uint64_t
+    vm_map_fake_tahoe_2_t map_local = (vm_map_fake_tahoe_2_t) map;
+    retval = map_local->timestamp;
+  } else if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma()) {
     vm_map_fake_sonoma_t map_local = (vm_map_fake_sonoma_t) map;
     retval = map_local->timestamp;
   } else if (macOS_Ventura() || macOS_Monterey_3_or_greater()) {
@@ -2492,8 +2674,15 @@ vm_map_offset_t vm_map_min(vm_map_t map)
   if (!map) {
     return 0;
   }
-  vm_map_fake_t map_local = (vm_map_fake_t) map;
-  return map_local->hdr.start;
+  vm_map_offset_t retval = 0;
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_fake_tahoe_4_t map_local = (vm_map_fake_tahoe_4_t) map;
+    retval = map_local->hdr.start;
+  } else {
+    vm_map_fake_t map_local = (vm_map_fake_t) map;
+    retval = map_local->hdr.start;
+  }
+  return retval;
 }
 
 vm_map_offset_t vm_map_max(vm_map_t map)
@@ -2501,8 +2690,15 @@ vm_map_offset_t vm_map_max(vm_map_t map)
   if (!map) {
     return 0;
   }
-  vm_map_fake_t map_local = (vm_map_fake_t) map;
-  return map_local->hdr.end;
+  vm_map_offset_t retval = 0;
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_fake_tahoe_4_t map_local = (vm_map_fake_tahoe_4_t) map;
+    retval = map_local->hdr.end;
+  } else {
+    vm_map_fake_t map_local = (vm_map_fake_t) map;
+    retval = map_local->hdr.end;
+  }
+  return retval;
 }
 
 vm_map_size_t vm_map_user_wire_limit(vm_map_t map)
@@ -2511,8 +2707,11 @@ vm_map_size_t vm_map_user_wire_limit(vm_map_t map)
     return 0;
   }
   vm_map_size_t retval;
-  if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
-      macOS_Ventura() || macOS_Monterey_3_or_greater())
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_fake_tahoe_4_t m = (vm_map_fake_tahoe_4_t) map;
+    retval = m->user_wire_limit;
+  } else if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
+             macOS_Ventura() || macOS_Monterey_3_or_greater())
   {
     vm_map_fake_monterey_3_t m = (vm_map_fake_monterey_3_t) map;
     retval = m->user_wire_limit;
@@ -2537,8 +2736,11 @@ vm_map_size_t vm_map_user_wire_size(vm_map_t map)
     return 0;
   }
   vm_map_size_t retval;
-  if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
-      macOS_Ventura() || macOS_Monterey_3_or_greater())
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_fake_tahoe_4_t m = (vm_map_fake_tahoe_4_t) map;
+    retval = m->user_wire_size;
+  } else if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
+             macOS_Ventura() || macOS_Monterey_3_or_greater())
   {
     vm_map_fake_monterey_3_t m = (vm_map_fake_monterey_3_t) map;
     retval = m->user_wire_size;
@@ -2562,8 +2764,11 @@ void vm_map_set_user_wire_size(vm_map_t map, vm_map_size_t new_size)
   if (!map) {
     return;
   }
-  if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
-      macOS_Ventura() || macOS_Monterey_3_or_greater())
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_fake_tahoe_4_t m = (vm_map_fake_tahoe_4_t) map;
+    m->user_wire_size = new_size;
+  } else if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
+             macOS_Ventura() || macOS_Monterey_3_or_greater())
   {
     vm_map_fake_monterey_3_t m = (vm_map_fake_monterey_3_t) map;
     m->user_wire_size = new_size;
@@ -2586,7 +2791,7 @@ bool vm_map_sealed(vm_map_t map)
   bool retval = false;
   if (macOS_Tahoe()) {
     vm_map_fake_tahoe_t map_local = (vm_map_fake_tahoe_t) map;
-    retval = map_local->is_sealed;
+    retval = (map_local->vmmap_sealed != VM_MAP_NOT_SEALED);
   }
   return retval;
 }
@@ -2595,7 +2800,7 @@ void vm_map_set_sealed(vm_map_t map, bool sealed)
 {
   if (macOS_Tahoe()) {
     vm_map_fake_tahoe_t map_local = (vm_map_fake_tahoe_t) map;
-    map_local->is_sealed = sealed;
+    map_local->vmmap_sealed = sealed ? VM_MAP_SEALED : VM_MAP_NOT_SEALED;
   }
 }
 
@@ -2730,14 +2935,68 @@ typedef struct _vm_map_entry_fake_monterey {
   unsigned short user_wired_count;  // Offset 0x4e
 } *vm_map_entry_fake_monterey_t;
 
+typedef struct _vm_map_entry_fake_tahoe_4 {
+  struct vm_map_links links;
+#define vme_prev  links.prev
+#define vme_next  links.next
+#define vme_start links.start
+#define vme_end   links.end
+  uint64_t pad1[1];
+  union vm_map_object vme_object;   /* object I point to, offset 0x28 */
+  vm_object_offset_t vme_offset;    /* offset into object */
+  unsigned int                      // Offset 0x38
+  /* boolean_t */ is_shared:1,      /* region is shared */
+  /* boolean_t */ __unused:1,
+  /* boolean_t */ in_transition:1,  /* Entry being changed */
+  /* boolean_t */ needs_wakeup:1,   /* Waiters on in_transition */
+  /* vm_behavior_t */ behavior:2,   /* user paging behavior hint */
+  /* behavior is not defined for submap type */
+  /* boolean_t */ needs_copy:1,     /* object need to be copied? */
+  /* Only in task maps: */
+  /* vm_prot_t */ protection:4,     /* protection code */
+  /* vm_prot_t */ max_protection:4, /* maximum protection */
+  /* vm_inherit_t */ inheritance:2, /* inheritance */
+  /* boolean_t */ use_pmap:1,       /* use_pmap is overloaded:
+                                     * if "is_sub_map":
+                                     *  use a nested pmap?
+                                     * else (i.e. if object):
+                                     *  use pmap accounting
+                                     *  for footprint?
+                                     */
+  /* boolean_t */ no_cache:1,       /* should new pages be cached? */
+  /* boolean_t */ permanent:1,      /* mapping can not be removed */
+  /* boolean_t */ superpage_size:1, /* use superpages of a certain size */
+  /* boolean_t */ zero_wired_pages:1, /* zero out the wired pages of
+                                       * this entry it is being deleted
+                                       * without unwiring them */
+  /* boolean_t */ used_for_jit:1,
+  /* boolean_t */ csm_associated:1, /* code signing monitor will validate */
+
+  /* iokit accounting: use the virtual size rather than resident size: */
+  /* boolean_t */ iokit_acct:1,
+  /* boolean_t */ vme_resilient_codesign:1,
+  /* boolean_t */ vme_resilient_media:1,
+  /* boolean_t */ vme_xnu_user_debug:1,
+  /* boolean_t */ vme_no_copy_on_read:1,
+  /* boolean_t */ translated_allow_execute:1, /* execute in translated processes */
+  /* boolean_t */ vme_kernel_object:1,        /* vme_object is a kernel_object */
+  __pad:1;
+  unsigned short wired_count;       // Offset 0x3c
+  unsigned short user_wired_count;  // Offset 0x3e
+} *vm_map_entry_fake_tahoe_4_t;
+
 bool vm_map_entry_get_superpage_size(vm_map_entry_t entry)
 {
   if (!entry) {
     return false;
   }
   bool retval = false;
-  if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
-      macOS_Ventura() || macOS_Monterey())
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_entry_fake_tahoe_4_t entry_local =
+      (vm_map_entry_fake_tahoe_4_t) entry;
+    retval = entry_local->superpage_size;
+  } else if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
+             macOS_Ventura() || macOS_Monterey())
   {
     vm_map_entry_fake_monterey_t entry_local =
       (vm_map_entry_fake_monterey_t) entry;
@@ -2760,8 +3019,15 @@ vm_map_entry_t vm_map_first_entry(vm_map_t map)
   if (!map) {
     return NULL;
   }
-  vm_map_fake_t map_local = (vm_map_fake_t) map;
-  return (map_local->links.next);
+  vm_map_entry_t retval = NULL;
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_fake_tahoe_4_t map_local = (vm_map_fake_tahoe_4_t) map;
+    retval = map_local->links.next;
+  } else {
+    vm_map_fake_t map_local = (vm_map_fake_t) map;
+    retval = map_local->links.next;
+  }
+  return retval;
 }
 
 vm_map_entry_t vm_map_to_entry(vm_map_t map)
@@ -2769,13 +3035,22 @@ vm_map_entry_t vm_map_to_entry(vm_map_t map)
   if (!map) {
     return NULL;
   }
-  vm_map_fake_t map_local = (vm_map_fake_t) map;
-  return (vm_map_entry_t) &(map_local->links);
+  vm_map_entry_t retval = NULL;
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_fake_tahoe_4_t map_local = (vm_map_fake_tahoe_4_t) map;
+    retval = (vm_map_entry_t) &(map_local->links);
+  } else {
+    vm_map_fake_t map_local = (vm_map_fake_t) map;
+    retval = (vm_map_entry_t) &(map_local->links);
+  }
+  return retval;
 }
 
 void vm_map_lock(vm_map_t map)
 {
-  if (!map) {
+  // As of macOS 26.4 Apple uses "new" locks internally, including in vm_map_t
+  // objects. "Old" methods don't work on them.
+  if (!map || macOS_Tahoe_4_or_greater()) {
     return;
   }
   vm_map_fake_t map_local = (vm_map_fake_t) map;
@@ -2784,7 +3059,9 @@ void vm_map_lock(vm_map_t map)
 
 bool vm_map_trylock(vm_map_t map)
 {
-  if (!map) {
+  // As of macOS 26.4 Apple uses "new" locks internally, including in vm_map_t
+  // objects. "Old" methods don't work on them.
+  if (!map || macOS_Tahoe_4_or_greater()) {
     return false;
   }
   vm_map_fake_t map_local = (vm_map_fake_t) map;
@@ -2793,7 +3070,9 @@ bool vm_map_trylock(vm_map_t map)
 
 void vm_map_lock_read(vm_map_t map)
 {
-  if (!map) {
+  // As of macOS 26.4 Apple uses "new" locks internally, including in vm_map_t
+  // objects. "Old" methods don't work on them.
+  if (!map || macOS_Tahoe_4_or_greater()) {
     return;
   }
   vm_map_fake_t map_local = (vm_map_fake_t) map;
@@ -2802,7 +3081,9 @@ void vm_map_lock_read(vm_map_t map)
 
 bool vm_map_trylock_read(vm_map_t map)
 {
-  if (!map) {
+  // As of macOS 26.4 Apple uses "new" locks internally, including in vm_map_t
+  // objects. "Old" methods don't work on them.
+  if (!map || macOS_Tahoe_4_or_greater()) {
     return false;
   }
   vm_map_fake_t map_local = (vm_map_fake_t) map;
@@ -2811,10 +3092,16 @@ bool vm_map_trylock_read(vm_map_t map)
 
 void vm_map_lock_write_to_read(vm_map_t map)
 {
-  if (!map) {
+  // As of macOS 26.4 Apple uses "new" locks internally, including in vm_map_t
+  // objects. "Old" methods don't work on them.
+  if (!map || macOS_Tahoe_4_or_greater()) {
     return;
   }
-  if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma()) {
+  if (macOS_Tahoe_2_or_greater()) {
+    vm_map_fake_tahoe_2_t map_local = (vm_map_fake_tahoe_2_t) map;
+    ++map_local->timestamp;
+    lck_rw_lock_exclusive_to_shared(&(map_local->lock));
+  } else if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma()) {
     vm_map_fake_sonoma_t map_local = (vm_map_fake_sonoma_t) map;
     ++map_local->timestamp;
     lck_rw_lock_exclusive_to_shared(&(map_local->lock));
@@ -2867,10 +3154,16 @@ void vm_map_lock_write_to_read(vm_map_t map)
 
 void vm_map_unlock(vm_map_t map)
 {
-  if (!map) {
+  // As of macOS 26.4 Apple uses "new" locks internally, including in vm_map_t
+  // objects. "Old" methods don't work on them.
+  if (!map || macOS_Tahoe_4_or_greater()) {
     return;
   }
-  if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma()) {
+  if (macOS_Tahoe_2_or_greater()) {
+    vm_map_fake_tahoe_2_t map_local = (vm_map_fake_tahoe_2_t) map;
+    ++map_local->timestamp;
+    lck_rw_done(&(map_local->lock));
+  } else if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma()) {
     vm_map_fake_sonoma_t map_local = (vm_map_fake_sonoma_t) map;
     ++map_local->timestamp;
     lck_rw_done(&(map_local->lock));
@@ -2923,7 +3216,9 @@ void vm_map_unlock(vm_map_t map)
 
 void vm_map_unlock_read(vm_map_t map)
 {
-  if (!map) {
+  // As of macOS 26.4 Apple uses "new" locks internally, including in vm_map_t
+  // objects. "Old" methods don't work on them.
+  if (!map || macOS_Tahoe_4_or_greater()) {
     return;
   }
   vm_map_fake_t map_local = (vm_map_fake_t) map;
@@ -2971,7 +3266,14 @@ bool map_entry_is_submap(vm_map_entry_t entry)
   if (macOS_Tahoe() || macOS_Sequoia() || macOS_Sonoma() ||
       macOS_Ventura() || macOS_Monterey_5_or_greater())
   {
-    uintptr_t value = (uintptr_t) entry_local->vme_object.vmo_object;
+    uintptr_t value;
+    if (macOS_Tahoe_4_or_greater()) {
+      vm_map_entry_fake_tahoe_4_t entry_local =
+        (vm_map_entry_fake_tahoe_4_t) entry;
+      value = (uintptr_t) entry_local->vme_object.vmo_object;
+    } else {
+      value = (uintptr_t) entry_local->vme_object.vmo_object;
+    }
     uintptr_t flag = (value & 0xffff);
     retval = ((flag & 2) != 0);
   } else {
@@ -3018,13 +3320,20 @@ union vm_map_object map_entry_object_unpack_ptr(vm_object_t p)
 // What's returned may be either an "object" or a "submap".
 union vm_map_object map_entry_object(vm_map_entry_t entry)
 {
+  union vm_map_object retval;
   if (!entry) {
-    union vm_map_object retval;
     retval.vmo_object = NULL;
     return retval;
   }
-  vm_map_entry_fake_t entry_local = (vm_map_entry_fake_t) entry;
-  return map_entry_object_unpack_ptr(entry_local->vme_object.vmo_object);
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_entry_fake_tahoe_4_t entry_local =
+      (vm_map_entry_fake_tahoe_4_t) entry;
+    retval = map_entry_object_unpack_ptr(entry_local->vme_object.vmo_object);
+  } else {
+    vm_map_entry_fake_t entry_local = (vm_map_entry_fake_t) entry;
+    retval = map_entry_object_unpack_ptr(entry_local->vme_object.vmo_object);
+  }
+  return retval;
 }
 
 vm_object_offset_t map_entry_offset(vm_map_entry_t entry)
@@ -3032,11 +3341,18 @@ vm_object_offset_t map_entry_offset(vm_map_entry_t entry)
   if (!entry) {
     return 0;
   }
-  vm_map_entry_fake_t entry_local = (vm_map_entry_fake_t) entry;
-  // We need to truncate the result the same way the kernel's
-  // VME_OFFSET() macro does.  Sometimes Apple leaves garbage in
-  // the 12 least significant bits.
-  return (entry_local->vme_offset & ~PAGE_MASK);
+  vm_object_offset_t retval;
+  // The lower 12 bits of 'vme_offset' are the 'vme_alias'. They need to be
+  // zeroed out.
+  if (macOS_Tahoe_4_or_greater()) {
+    vm_map_entry_fake_tahoe_4_t entry_local =
+      (vm_map_entry_fake_tahoe_4_t) entry;
+    retval = (entry_local->vme_offset & ~PAGE_MASK);
+  } else {
+    vm_map_entry_fake_t entry_local = (vm_map_entry_fake_t) entry;
+    retval = (entry_local->vme_offset & ~PAGE_MASK);
+  }
+  return retval;
 }
 
 // Assumes the entire region we're interested in (from 'start' to 'end') has
@@ -4537,6 +4853,48 @@ typedef struct _vm_object_fake_sonoma_1 {
     __object2_unused_bits:7; /* for expansion */
 } *vm_object_fake_sonoma_1_t;
 
+typedef struct _vm_object_fake_tahoe_4 {
+  uint64_t pad1[1];
+  lck_rw_t Lock;
+  uint64_t pad2[6];
+  vm_object_t shadow; // Offset 0x48
+  uint64_t pad3[1];
+  union {
+    vm_object_offset_t vou_shadow_offset; /* Offset into shadow (offset 0x58) */
+    clock_sec_t vou_cache_ts; /* age of an external object
+                               * present in cache
+                               */
+    task_t vou_owner; /* If the object is purgeable
+                       * or has a "ledger_tag", this
+                       * is the task that owns it.
+                       */
+  } vo_un2;
+  uint32_t pad4[19];
+  /* hold object lock when altering */
+  unsigned int // Offset 0xac
+    unknown1:16,
+    wimg_bits:8,    /* cache WIMG bits */
+    unknown2:8;
+  unsigned int // Offset 0xb0
+    code_signed:1,  /* pages are signed and should be
+                       validated; the signatures are stored
+                       with the pager */
+    transposed:1,   /* object was transposed with another */
+    mapping_in_progress:1, /* pager being mapped/unmapped */
+    phantom_isssd:1,
+    volatile_empty:1,
+    volatile_fault:1,
+    all_reusable:1,
+    blocked_access:1,
+    set_cache_attr:1,
+    object_is_shared_cache:1,
+    purgeable_queue_type:2,
+    purgeable_queue_group:3,
+    io_tracking:1,
+    no_tag_update:1,
+    unknown3:15;
+} *vm_object_fake_tahoe_4_t;
+
 bool object_is_code_signed(vm_object_t object)
 {
   if (!object) {
@@ -4601,10 +4959,14 @@ bool object_is_code_signed(vm_object_t object)
   } else if (macOS_Monterey_7_1_or_greater() ||
              macOS_Ventura_6_1_or_greater() ||
              macOS_Sonoma_1_or_greater() ||
-             macOS_Sequoia() || macOS_Tahoe())
+             macOS_Sequoia() || macOS_Tahoe_less_than_4())
   {
     vm_object_fake_sonoma_1_t object_local =
       (vm_object_fake_sonoma_1_t) object;
+    retval = object_local->code_signed;
+  } else if (macOS_Tahoe_4_or_greater()) {
+    vm_object_fake_tahoe_4_t object_local =
+      (vm_object_fake_tahoe_4_t) object;
     retval = object_local->code_signed;
   } else {
     if (kernel_type_is_release()) {
@@ -4685,10 +5047,14 @@ void object_set_code_signed(vm_object_t object, bool flag)
   } else if (macOS_Monterey_7_1_or_greater() ||
              macOS_Ventura_6_1_or_greater() ||
              macOS_Sonoma_1_or_greater() ||
-             macOS_Sequoia() || macOS_Tahoe())
+             macOS_Sequoia() || macOS_Tahoe_less_than_4())
   {
     vm_object_fake_sonoma_1_t object_local =
       (vm_object_fake_sonoma_1_t) object;
+    object_local->code_signed = flag;
+  } else if (macOS_Tahoe_4_or_greater()) {
+    vm_object_fake_tahoe_4_t object_local =
+      (vm_object_fake_tahoe_4_t) object;
     object_local->code_signed = flag;
   } else {
     if (kernel_type_is_release()) {
@@ -5257,6 +5623,111 @@ typedef struct _proc_fake_sonoma_dev_4 {
   uint32_t pad6[51];
   u_short p_acflag;       // Offset 0x6cc
 } *proc_fake_sonoma_dev_4_t;
+
+// As of macOS 26.4 we need to deal with p_csflags, and with the "read only"
+// zone in which it exists.
+
+// From osfmk/kern/zalloc.h. Not complete.
+typedef enum : uint16_t {
+  ZONE_ID__ZERO,
+
+  ZONE_ID_PERMANENT,
+  ZONE_ID_PERCPU_PERMANENT,
+
+  ZONE_ID_THREAD_RO,
+  ZONE_ID_MAC_LABEL,
+  ZONE_ID_PROC_RO,
+  ZONE_ID_PROC_SIGACTS_RO,
+  ZONE_ID_KAUTH_CRED,
+  ZONE_ID_CS_BLOB,
+
+  ZONE_ID_SANDBOX_RO,
+  ZONE_ID_PROFILE_RO,
+  ZONE_ID_PROTOBOX,
+  ZONE_ID_SB_FILTER,
+  ZONE_ID_AMFI_OSENTITLEMENTS,
+
+  ZONE_ID__FIRST_RO = ZONE_ID_THREAD_RO,
+  ZONE_ID__FIRST_RO_EXT = ZONE_ID_SANDBOX_RO,
+  ZONE_ID__LAST_RO_EXT = ZONE_ID_AMFI_OSENTITLEMENTS,
+  ZONE_ID__LAST_RO = ZONE_ID__LAST_RO_EXT,
+} zone_reserved_id_t;
+
+typedef struct _proc_ro_fake_tahoe_4 {
+  uint32_t pad1[9];
+  uint32_t p_csflags;     // Offset 0x24
+} *proc_ro_fake_tahoe_4_t;
+
+typedef struct _proc_fake_tahoe_4 {
+  uint64_t pad1[3];
+  proc_ro_fake_tahoe_4_t p_proc_ro; // Offset 0x18
+  uint64_t pad2[8];
+  pid_t p_pid;            // Offset 0x60
+  uint32_t pad3[272];
+  unsigned int p_flag;    // P_* flags (offset 0x4a4)
+  unsigned int p_lflag;   // Offset 0x4a8
+  uint32_t pad4[75];
+  uint32_t p_argslen;     // Length of "string area" at beginning of user stack (offset 0x5d8)
+  int32_t p_argc;         // Offset 0x5dc
+  user_addr_t user_stack; // Where user stack was allocated (offset 0x5e0)
+  uint32_t pad5[51];
+  u_short p_acflag;       // Offset 0x6b4
+} *proc_fake_tahoe_4_t;
+
+typedef struct _proc_fake_tahoe_dev_4 {
+  uint64_t pad1[3];
+  proc_ro_fake_tahoe_4_t p_proc_ro; // Offset 0x18
+  uint64_t pad2[8];
+  pid_t p_pid;            // Offset 0x60
+  uint32_t pad3[278];
+  unsigned int p_flag;    // P_* flags (offset 0x4bc)
+  unsigned int p_lflag;   // Offset 0x4c0
+  uint32_t pad4[75];
+  uint32_t p_argslen;     // Length of "string area" at beginning of user stack (offset 0x5f0)
+  int32_t p_argc;         // Offset 0x5f4
+  user_addr_t user_stack; // Where user stack was allocated (offset 0x5f8)
+  uint32_t pad5[51];
+  u_short p_acflag;       // Offset 0x6cc
+} *proc_fake_tahoe_dev_4_t;
+
+static uint32_t proc_get_csflags(proc_t proc)
+{
+  if (!proc) {
+    return 0;
+  }
+  uint32_t retval = 0;
+  if (macOS_Tahoe_4_or_greater()) {
+    proc_fake_tahoe_4_t proc_local = (proc_fake_tahoe_4_t) proc;
+    proc_ro_fake_tahoe_4_t proc_ro_local = proc_local->p_proc_ro;
+    if (proc_ro_local) {
+      retval = proc_ro_local->p_csflags;
+    }
+  }
+  return retval;
+}
+
+static void proc_set_csflags(proc_t proc, uint32_t new_csflags)
+{
+  if (!proc) {
+    return;
+  }
+  if (macOS_Tahoe_4_or_greater()) {
+    proc_fake_tahoe_4_t proc_local = (proc_fake_tahoe_4_t) proc;
+    proc_ro_fake_tahoe_4_t proc_ro_local = proc_local->p_proc_ro;
+    if (proc_ro_local) {
+      // We need this to make changes to the "read only" zone in which
+      // p_csflags exists.
+      zalloc_ro_mut(ZONE_ID_PROC_RO, proc_ro_local,
+                    offsetof(struct _proc_ro_fake_tahoe_4, p_csflags),
+                    &new_csflags, sizeof(proc_ro_local->p_csflags));
+    }
+  }
+}
+
+static void proc_clear_csflags(proc_t proc, uint32_t csflags_to_clear)
+{
+  proc_set_csflags(proc, proc_get_csflags(proc) & ~csflags_to_clear);
+}
 
 static uint64_t proc_uniqueid(proc_t proc)
 {
@@ -6802,7 +7273,17 @@ void vm_submap_iterate_entries(vm_map_t submap, vm_map_offset_t start,
     end_fixed += vm_map_page_size(submap);
   }
 
-  vm_map_lock(submap);
+  // As of macOS 26.4 Apple uses "new" locks internally, including in vm_map_t
+  // objects. "Old" methods don't work on them. To use the "new" methods we'd
+  // need to reverse engineer them, since Apple has stripped their symbols
+  // from the kernel's symbol table. But it seems we don't really need to lock
+  // 'submap' here.
+  boolean_t org_int_level = 0;
+  if (macOS_Tahoe_4_or_greater()) {
+    org_int_level = ml_set_interrupts_enabled(false);
+  } else {
+    vm_map_lock(submap);
+  }
 
   vm_map_entry_t entry;
   vm_map_offset_t entry_start;
@@ -6835,7 +7316,11 @@ void vm_submap_iterate_entries(vm_map_t submap, vm_map_offset_t start,
     entry_start = map_entry_start(entry);
   }
 
-  vm_map_unlock(submap);
+  if (macOS_Tahoe_4_or_greater()) {
+    ml_set_interrupts_enabled(org_int_level);
+  } else {
+    vm_map_unlock(submap);
+  }
 }
 
 void vm_map_iterate_entries(vm_map_t map, vm_map_offset_t start,
@@ -6863,7 +7348,17 @@ void vm_map_iterate_entries(vm_map_t map, vm_map_offset_t start,
     end_fixed += vm_map_page_size(map);
   }
 
-  vm_map_lock(map);
+  // As of macOS 26.4 Apple uses "new" locks internally, including in vm_map_t
+  // objects. "Old" methods don't work on them. To use the "new" methods we'd
+  // need to reverse engineer them, since Apple has stripped their symbols
+  // from the kernel's symbol table. But it seems we don't really need to lock
+  // 'map' here.
+  boolean_t org_int_level = 0;
+  if (macOS_Tahoe_4_or_greater()) {
+    org_int_level = ml_set_interrupts_enabled(false);
+  } else {
+    vm_map_lock(map);
+  }
 
   vm_map_entry_t entry;
   vm_map_offset_t entry_start;
@@ -6895,7 +7390,11 @@ void vm_map_iterate_entries(vm_map_t map, vm_map_offset_t start,
     entry_start = map_entry_start(entry);
   }
 
-  vm_map_unlock(map);
+  if (macOS_Tahoe_4_or_greater()) {
+    ml_set_interrupts_enabled(org_int_level);
+  } else {
+    vm_map_unlock(map);
+  }
 }
 
 #if (0)
@@ -12739,6 +13238,15 @@ bool maybe_cast_hook(proc_t proc)
   if (!rv1 || !rv2 || !rv3 || !rv4 || !rv5 || !rv6) {
     free_hook(hookp);
     return false;
+  }
+
+  // On macOS 26.4 and higher we make macOS allow unsigned code. Without this
+  // intervention our process crashes on a Code Signature Invalid access error
+  // even when we codesign our hook library (when Filesystem Protections are
+  // enabled in SIP). So as of macOS 26.4 you no longer need to codesign your
+  // hook libraries.
+  if (macOS_Tahoe_4_or_greater()) {
+    proc_clear_csflags(proc, CS_HARD | CS_KILL);
   }
 
   hookp->state = hook_state_cast;
