@@ -767,6 +767,22 @@ bool macOS_Tahoe_4_or_greater()
   return ((OSX_Version() & 0xFF) >= 0x40);
 }
 
+bool macOS_Tahoe_less_than_5()
+{
+  if (!((OSX_Version() & 0xFF00) == MAC_OS_X_VERSION_26_HEX)) {
+    return false;
+  }
+  return ((OSX_Version() & 0xFF) < 0x50);
+}
+
+bool macOS_Tahoe_5_or_greater()
+{
+  if (!((OSX_Version() & 0xFF00) == MAC_OS_X_VERSION_26_HEX)) {
+    return false;
+  }
+  return ((OSX_Version() & 0xFF) >= 0x50);
+}
+
 bool OSX_Version_Unsupported()
 {
   return (((OSX_Version() & 0xFF00) < MAC_OS_X_VERSION_10_9_HEX) ||
@@ -2541,7 +2557,7 @@ typedef struct _vm_map_fake_tahoe_4 {
   // the "new" methods have their symbols stripped from the symbol table. So we
   // can't manipulate "new" locks until we reverse-engineer the "new" methods.
   lck_rw_t lock;
-  uint64_t pad1[1];
+  uint64_t unlink_timestamp;
   struct vm_map_links links; // Actually 1st member of "struct vm_map_header hdr"
 #define hdr links
   uint64_t pad2[4];
@@ -2621,8 +2637,8 @@ uint64_t vm_map_timestamp(vm_map_t map)
   }
   uint64_t retval = 0;
   if (macOS_Tahoe_4_or_greater()) {
-    // timestamp seems to have disappeared as of macOS 26.4.
-    return 0;
+    vm_map_fake_tahoe_4_t map_local = (vm_map_fake_tahoe_4_t) map;
+    retval = map_local->unlink_timestamp;
   } else if (macOS_Tahoe_2_or_greater()) {
     // As of macOS 26.2 timestamp changed from unsigned int to uint64_t
     vm_map_fake_tahoe_2_t map_local = (vm_map_fake_tahoe_2_t) map;
@@ -4871,10 +4887,9 @@ typedef struct _vm_object_fake_tahoe_4 {
   } vo_un2;
   uint32_t pad4[19];
   /* hold object lock when altering */
-  unsigned int // Offset 0xac
-    unknown1:16,
-    wimg_bits:8,    /* cache WIMG bits */
-    unknown2:8;
+  vm_tag_t wire_tag;
+  uint8_t wimg_bits; // Offset 0xae
+  uint8_t scan_collisions;
   unsigned int // Offset 0xb0
     code_signed:1,  /* pages are signed and should be
                        validated; the signatures are stored
@@ -8687,6 +8702,7 @@ typedef struct _task_fake_sequoia_dev_4 {
 } *task_fake_sequoia_dev_4_t;
 
 typedef struct _task_fake_tahoe {
+  // Even on macOS 26.4 and up, this is still an "old" lock.
   lck_mtx_t lock;       // Size 0x10
   uint64_t pad1[8];
   queue_head_t threads; // Size 0x10, offset 0x50
@@ -8698,6 +8714,7 @@ typedef struct _task_fake_tahoe {
 } *task_fake_tahoe_t;
 
 typedef struct _task_fake_tahoe_dev {
+  // Even on macOS 26.4 and up, this is still an "old" lock.
   lck_mtx_t lock;       // Size 0x10
   uint64_t pad1[12];
   queue_head_t threads; // Size 0x10, offset 0x70
@@ -8707,6 +8724,30 @@ typedef struct _task_fake_tahoe_dev {
   mach_vm_address_t all_image_info_addr; // Offset 0x590
   mach_vm_size_t all_image_info_size;    // Offset 0x598
 } *task_fake_tahoe_dev_t;
+
+typedef struct _task_fake_tahoe_5 {
+  // Even on macOS 26.4 and up, this is still an "old" lock.
+  lck_mtx_t lock;       // Size 0x10
+  uint64_t pad1[8];
+  queue_head_t threads; // Size 0x10, offset 0x50
+  uint64_t pad3[113];
+  volatile uint32_t t_flags; /* Offset 0x3e8, general-purpose task flags protected by task_lock (TL) */
+  uint32_t pad4[1];
+  mach_vm_address_t all_image_info_addr; // Offset 0x3f0
+  mach_vm_size_t all_image_info_size;    // Offset 0x3f8
+} *task_fake_tahoe_5_t;
+
+typedef struct _task_fake_tahoe_dev_5 {
+  // Even on macOS 26.4 and up, this is still an "old" lock.
+  lck_mtx_t lock;       // Size 0x10
+  uint64_t pad1[12];
+  queue_head_t threads; // Size 0x10, offset 0x70
+  uint64_t pad3[162];
+  volatile uint32_t t_flags; /* Offset 0x590, general-purpose task flags protected by task_lock (TL) */
+  uint32_t pad4[1];
+  mach_vm_address_t all_image_info_addr; // Offset 0x598
+  mach_vm_size_t all_image_info_size;    // Offset 0x5a0
+} *task_fake_tahoe_dev_5_t;
 
 void task_lock(task_t task)
 {
@@ -8734,7 +8775,15 @@ mach_vm_address_t task_all_image_info_addr(task_t task)
 
   static vm_map_offset_t offset_in_struct = -1;
   if (offset_in_struct == -1) {
-    if (macOS_Tahoe()) {
+    if (macOS_Tahoe_5_or_greater()) {
+      if (kernel_type_is_release()) {
+        offset_in_struct =
+          offsetof(struct _task_fake_tahoe_5, all_image_info_addr);
+      } else if (kernel_type_is_development()) {
+        offset_in_struct =
+          offsetof(struct _task_fake_tahoe_dev_5, all_image_info_addr);
+      }
+    } else if (macOS_Tahoe_less_than_5()) {
       if (kernel_type_is_release()) {
         offset_in_struct =
           offsetof(struct _task_fake_tahoe, all_image_info_addr);
@@ -8861,7 +8910,15 @@ mach_vm_size_t task_all_image_info_size(task_t task)
 
   static vm_map_offset_t offset_in_struct = -1;
   if (offset_in_struct == -1) {
-    if (macOS_Tahoe()) {
+    if (macOS_Tahoe_5_or_greater()) {
+      if (kernel_type_is_release()) {
+        offset_in_struct =
+          offsetof(struct _task_fake_tahoe_5, all_image_info_size);
+      } else if (kernel_type_is_development()) {
+        offset_in_struct =
+          offsetof(struct _task_fake_tahoe_dev_5, all_image_info_size);
+      }
+    } else if (macOS_Tahoe_less_than_5()) {
       if (kernel_type_is_release()) {
         offset_in_struct =
           offsetof(struct _task_fake_tahoe, all_image_info_size);
@@ -8988,7 +9045,14 @@ uint32_t task_flags(task_t task)
 
   static vm_map_offset_t offset_in_struct = -1;
   if (offset_in_struct == -1) {
-    if (macOS_Tahoe()) {
+    if (macOS_Tahoe_5_or_greater()) {
+      if (kernel_type_is_release()) {
+        offset_in_struct = offsetof(struct _task_fake_tahoe_5, t_flags);
+      } else if (kernel_type_is_development()) {
+        offset_in_struct =
+          offsetof(struct _task_fake_tahoe_dev_5, t_flags);
+      }
+    } else if (macOS_Tahoe_less_than_5()) {
       if (kernel_type_is_release()) {
         offset_in_struct = offsetof(struct _task_fake_tahoe, t_flags);
       } else if (kernel_type_is_development()) {

@@ -1,3 +1,9 @@
+# What's New in Version 10.0.2
+
+macOS 26.5 broke HookCase by making one internal change. HookCase
+10.0.2 works around it. This resolves
+[Issue #54](https://github.com/steven-michaud/HookCase/issues/54).
+
 # What's New in Version 10.0.1
 
 macOS 26.4 broke HookCase by making many internal changes. HookCase
@@ -257,14 +263,14 @@ information see
 
 This version of HookCase fixes a bug that caused intermittent
 instability, though not kernel panics. I fixed it by tweaking the
-[code at the heart of HookCase's watchpoint support](HookCase/HookCase/HookCase.cpp#L16851).
+[code at the heart of HookCase's watchpoint support](HookCase/HookCase/HookCase.cpp#L16915).
 See [Issue #26](https://github.com/steven-michaud/HookCase/issues/26)
 for more information.
 
 HookCase's watchpoint code is quite complex. So if you see any sort of
 instability short of kernel panics, especially if it resembles what's
 reported at Issue #26, you should try
-[disabling watchpoint support](HookCase/HookCase/HookCase.cpp#L17790).
+[disabling watchpoint support](HookCase/HookCase/HookCase.cpp#L17854).
 
 # What's New in Version 5.0.3
 
@@ -440,7 +446,7 @@ HookCase now supports macOS Mojave (10.14).
 
 But Mojave's Debug kernel is currently very flaky -- lots of panics,
 with and without HookCase.  So support for the Debug kernel
-[has been disabled](HookCase/HookCase/HookCase.cpp#L851), at least
+[has been disabled](HookCase/HookCase/HookCase.cpp#L867), at least
 temporarily.
 
 # What's New in Version 2.1
@@ -470,12 +476,12 @@ can now hook methods that aren't in their module's symbol table.  For
 more information see
 [Hooked_sub_123abc() in the hook library template](HookLibraryTemplate/hook.mm#L1302).
 
-* Version 2.0 [fixes a bug](HookCase/HookCase/HookCase.cpp#L14494) that
+* Version 2.0 [fixes a bug](HookCase/HookCase/HookCase.cpp#L14558) that
 prevented interpose hooks from working outside the shared cache of
 system modules.
 
 * Version 2.0
-[fixes a previously undiscovered edge case](HookCase/HookCase/HookCase.cpp#L16293)
+[fixes a previously undiscovered edge case](HookCase/HookCase/HookCase.cpp#L16357)
 of an Apple kernel panic bug that was partially fixed in version 1.
 
 * Version 2.0
